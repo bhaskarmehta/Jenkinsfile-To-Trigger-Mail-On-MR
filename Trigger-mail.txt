@@ -1,0 +1,252 @@
+pipeline {
+    agent any
+
+    environment {
+        // Define a shared location for the commit file - will be set dynamically
+        SHARED_COMMIT_FILE = "" // This will be set in the script
+        CURRENT_BRANCH = "" // This will store the current branch for post section
+    }
+
+    stages {
+        stage('Checkout Code') {
+            steps {
+                checkout([
+                    $class: 'GitSCM',
+                    branches: [[name: '*/${gitlabSourceBranch}']],
+                    extensions: [],
+                    userRemoteConfigs: [[
+                        url: 'http://10.195.82.243:8080/agriculture/krishidss/satellite-data-service',
+                        credentialsId: 'gitlab-cred'
+                    ]]
+                ])
+            }
+        }
+        stage('Collect Commits for MR') {
+            steps {
+                script {
+                    // Get the current branch name - handle detached HEAD state
+                    def currentBranch = ""
+                    try {
+                        currentBranch = sh(
+                            script: "git rev-parse --abbrev-ref HEAD",
+                            returnStdout: true
+                        ).trim()
+                        
+                        // If we're in detached HEAD state, this might return "HEAD"
+                        if (currentBranch == "HEAD") {
+                            // Try to get branch name from gitlab environment variable
+                            if (env.gitlabSourceBranch) {
+                                currentBranch = env.gitlabSourceBranch
+                                echo "Using GitLab source branch: ${currentBranch}"
+                            } else {
+                                // Fallback: try to get branch from git describe
+                                currentBranch = sh(
+                                    script: "git describe --all --contains HEAD | sed 's/.*\\///'",
+                                    returnStdout: true
+                                ).trim()
+                                echo "Using git describe branch: ${currentBranch}"
+                            }
+                        }
+                    } catch (Exception e) {
+                        echo "Error getting branch name: ${e.message}"
+                        // Use GitLab environment variable as fallback
+                        if (env.gitlabSourceBranch) {
+                            currentBranch = env.gitlabSourceBranch
+                            echo "Using GitLab source branch as fallback: ${currentBranch}"
+                        } else {
+                            currentBranch = "unknown-branch"
+                            echo "Could not determine branch name, using 'unknown-branch'"
+                        }
+                    }
+
+                    // Store in environment variable for post section
+                    env.CURRENT_BRANCH = currentBranch
+                    echo "Final current branch: ${env.CURRENT_BRANCH}"
+
+                    // Use GitLab environment variables for merge request information
+                    def targetBranch = ""
+                    if (env.gitlabTargetBranch) {
+                        // GitLab provides the target branch in gitlabTargetBranch environment variable
+                        targetBranch = "origin/${env.gitlabTargetBranch}"
+                        echo "Using target branch from GitLab: ${targetBranch}"
+                    } else if (env.CHANGE_TARGET) {
+                        // For Jenkins GitHub Branch Source plugin (alternative)
+                        targetBranch = "origin/${env.CHANGE_TARGET}"
+                        echo "Using target branch from Jenkins: ${targetBranch}"
+                    } else {
+                        // Fallback: try to extract from git merge configuration
+                        try {
+                            def mergeConfig = sh(
+                                script: "git config branch.${currentBranch}.merge",
+                                returnStdout: true
+                            ).trim()
+                            
+                            if (mergeConfig) {
+                                targetBranch = mergeConfig.replace('refs/heads/', 'origin/')
+                                echo "Using target branch from git config: ${targetBranch}"
+                            } else {
+                                // Last resort: try common target branch names
+                                def commonTargets = ['main', 'master', 'uat', 'staging', 'production']
+                                for (target in commonTargets) {
+                                    try {
+                                        // Check if the target branch exists remotely
+                                        sh "git ls-remote --exit-code --heads origin ${target}"
+                                        targetBranch = "origin/${target}"
+                                        echo "Using common target branch: ${targetBranch}"
+                                        break
+                                    } catch (Exception e) {
+                                        // Branch doesn't exist, continue to next
+                                        continue
+                                    }
+                                }
+                            }
+                        } catch (Exception e) {
+                            error "Could not determine target branch and no fallback found. Error: ${e.message}"
+                        }
+                    }
+
+                    if (!targetBranch) {
+                        error "Failed to determine target branch. Available GitLab env vars: ${env.getEnvironment().findAll { it.key.contains('gitlab') || it.key.contains('CHANGE') }}"
+                    }
+
+                    // Get target branch name without 'origin/' prefix
+                    def targetBranchName = targetBranch.replace('origin/', '')
+                    
+                    // Set the dynamic shared file path with target branch name
+                    def sharedFilePath = "/var/jenkins_shared/commits/all_mr_commits_${targetBranchName}.txt"
+                    env.SHARED_COMMIT_FILE = sharedFilePath
+                    echo "Using shared file: ${sharedFilePath}"
+
+                    // Get all commits that are in current branch but not in target branch
+                    def commitList = sh(
+                        script: "git log ${targetBranch}..HEAD --pretty=format:'%h %an - %s (%ad)' --date=short",
+                        returnStdout: true
+                    ).trim()
+
+                    if (!commitList) {
+                        commitList = "No commits detected in this MR."
+                    }
+
+                    env.MERGE_MESSAGE = "Merge request from ${currentBranch} to ${targetBranchName}"
+                    env.COMMIT_LIST   = commitList
+                    env.TARGET_BRANCH = targetBranchName
+
+                    echo "Current Branch: ${currentBranch}"
+                    echo "Target Branch: ${targetBranch}"
+                    echo "Commits in MR:\n${commitList}"
+
+                    // Write commits to shared file
+                    writeCommitsToFile(commitList, currentBranch, targetBranch, sharedFilePath)
+                }
+            }
+        }    
+    }   
+
+    post {
+        success {
+            script {
+                // Read the shared file content for email
+                def sharedFileContent = ""
+                try {
+                    if (env.SHARED_COMMIT_FILE && fileExists(env.SHARED_COMMIT_FILE)) {
+                        sharedFileContent = readFile(env.SHARED_COMMIT_FILE)
+                    } else {
+                        sharedFileContent = "Shared file does not exist at: ${env.SHARED_COMMIT_FILE ?: 'unknown location'}"
+                    }
+                } catch (Exception e) {
+                    sharedFileContent = "Unable to read shared file: ${e.message}"
+                }
+
+                // Use GitLab source branch if CURRENT_BRANCH is still null
+                def sourceBranch = env.CURRENT_BRANCH ?: env.gitlabSourceBranch ?: "unknown-branch"
+                
+                emailext(
+                    to: 'bhaskar2@amnex.com',
+                    subject: "✅ Jenkins Build Success: ${env.JOB_NAME} #${env.BUILD_NUMBER}",
+                    body: """
+                    Hello,
+
+                    The Jenkins job *${env.JOB_NAME}* build #${env.BUILD_NUMBER} for ${sourceBranch}→${env.TARGET_BRANCH} MR succeeded.
+
+                    Commits included in this MR:
+                    ${env.COMMIT_LIST}
+
+                    Shared File Location: ${env.SHARED_COMMIT_FILE}
+                    Shared File Content:
+                    ${sharedFileContent}
+
+                    Check console: ${env.BUILD_URL}
+
+                    Regards,
+                    Jenkins
+                    """
+                )
+            }
+        }
+        failure {
+            script {
+                // Use GitLab source branch if CURRENT_BRANCH is still null
+                def sourceBranch = env.CURRENT_BRANCH ?: env.gitlabSourceBranch ?: "unknown-branch"
+                
+                emailext(
+                    to: 'bhaskar2@amnex.com',
+                    subject: "❌ Jenkins Build Failed: ${env.JOB_NAME} #${env.BUILD_NUMBER}",
+                    body: """
+                    Hello,
+
+                    The Jenkins job *${env.JOB_NAME}* build #${env.BUILD_NUMBER} for ${sourceBranch}→${env.TARGET_BRANCH} MR failed.
+
+                    Commits attempted in this MR:
+                    ${env.COMMIT_LIST}
+
+                    Shared File Location: ${env.SHARED_COMMIT_FILE}
+
+                    Check console: ${env.BUILD_URL}
+
+                    Regards,
+                    Jenkins
+                    """
+                )
+            }
+        }
+    }
+}
+
+// Function to write commits to shared file
+def writeCommitsToFile(commitList, currentBranch, targetBranch, sharedFilePath) {
+    // Create directory if it doesn't exist
+    sh "mkdir -p /var/jenkins_shared/commits/"
+    
+    // Extract repository name from the Git remote URL
+    def gitUrl = sh(
+        script: "git config --get remote.origin.url",
+        returnStdout: true
+    ).trim()
+    
+    def repoName = gitUrl.split('/').last() // This will give 'krishi-chat-service'
+    
+    // Get current timestamp
+    def timestamp = sh(script: "date '+%Y-%m-%d %H:%M:%S'", returnStdout: true).trim()
+    
+    // Get target branch name without 'origin/' prefix for the file entry
+    def targetBranchName = targetBranch.replace('origin/', '')
+    
+    // Create entry for this MR
+    def entry = """=== MR COMMIT ENTRY ===
+// Repository: ${repoName}
+Git URL: ${gitUrl}
+Timestamp: ${timestamp}
+Build: ${env.JOB_NAME} #${env.BUILD_NUMBER}
+Branch: ${currentBranch} -> ${targetBranchName}
+Commits:
+${commitList}
+=======================
+"""
+
+    // Write to shared file using a temporary file to avoid shell escaping issues
+    writeFile file: 'temp_commit_entry.txt', text: entry
+    sh "cat temp_commit_entry.txt >> ${sharedFilePath}"
+    sh "rm -f temp_commit_entry.txt"
+    
+    echo "Commits written to shared file: ${sharedFilePath}"
+}

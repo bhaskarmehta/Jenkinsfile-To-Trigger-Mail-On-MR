@@ -1,0 +1,134 @@
+pipeline {
+    agent any
+
+    parameters {
+        choice(
+            name: 'TARGET_ENV',
+            choices: ['uat', 'master', 'prod'],
+            description: 'Select the environment to fetch commit report from'
+        )
+        string(name: 'ATTACHMENT_FILENAME', defaultValue: 'commit_report.txt')
+        string(name: 'EMAIL_RECIPIENT', defaultValue: 'bhaskar2@amnex.com')
+        booleanParam(name: 'DELETE_AFTER_SEND', defaultValue: true)
+    }
+
+    stages {
+        stage('Validate Input') {
+            steps {
+                script {
+                    // Dynamically build shared file path
+                    env.SHARED_COMMIT_FILE = "/var/jenkins_shared/commits/all_mr_commits_${params.TARGET_ENV}.txt"
+
+                    if (!params.ATTACHMENT_FILENAME?.trim()) {
+                        error "Filename cannot be empty"
+                    }
+                    def cleanFilename = params.ATTACHMENT_FILENAME.replaceAll('.*/', '')
+                    if (!cleanFilename.matches('^[a-zA-Z0-9._-]+$')) {
+                        error "Invalid filename: only letters, numbers, dots, underscores, and hyphens allowed"
+                    }
+
+                    env.ATTACHMENT_FILENAME = cleanFilename
+
+                    echo "Selected environment: ${params.TARGET_ENV}"
+                    echo "Shared file path: ${env.SHARED_COMMIT_FILE}"
+                    echo "Attachment name: ${env.ATTACHMENT_FILENAME}"
+                }
+            }
+        }
+
+        stage('Prepare and Send Email') {
+            steps {
+                script {
+                    // Verify file exists
+                    def exists = sh(script: "test -f ${env.SHARED_COMMIT_FILE} && echo yes || echo no", returnStdout: true).trim()
+                    if (exists != "yes") {
+                        error "Shared commit file not found: ${env.SHARED_COMMIT_FILE}"
+                    }
+
+                    // Collect stats
+                    def fileSize = sh(script: "du -h ${env.SHARED_COMMIT_FILE} | cut -f1", returnStdout: true).trim()
+                    def lineCount = sh(script: "wc -l < ${env.SHARED_COMMIT_FILE}", returnStdout: true).trim()
+                    def mrEntryCount = sh(script: "grep -c '=== MR COMMIT ENTRY ===' ${env.SHARED_COMMIT_FILE} || echo 0", returnStdout: true).trim()
+
+                    // Copy into workspace for attachment
+                    sh "cp ${env.SHARED_COMMIT_FILE} ${env.WORKSPACE}/${env.ATTACHMENT_FILENAME}"
+
+                    emailext(
+                        to: params.EMAIL_RECIPIENT,
+                        subject: "📋 Commit Report (${params.TARGET_ENV}) - ${env.JOB_NAME} #${env.BUILD_NUMBER}",
+                        body: """
+                        Hello,
+
+                        Attached is the shared commit report.
+
+                        File Information:
+                        - Source Location: ${env.SHARED_COMMIT_FILE}
+                        - Attachment Name: ${env.ATTACHMENT_FILENAME}
+                        - Total MR Entries: ${mrEntryCount}
+                        - File Size: ${fileSize}
+                        - Lines: ${lineCount}
+                        - Generated: ${new Date()}
+                        - Source File Deleted: ${params.DELETE_AFTER_SEND ? 'Yes' : 'No'}
+
+                        Regards,
+                        Jenkins
+                        """,
+                        attachmentsPattern: env.ATTACHMENT_FILENAME
+                    )
+
+                    echo "✅ Email sent successfully to ${params.EMAIL_RECIPIENT}"
+                }
+            }
+        }
+
+        stage('Delete Original Shared File') {
+            when {
+                expression { return params.DELETE_AFTER_SEND }
+            }
+            steps {
+                script {
+                    echo "Deleting shared file: ${env.SHARED_COMMIT_FILE}"
+                    sh "rm -f ${env.SHARED_COMMIT_FILE}"
+                }
+            }
+        }
+
+        stage('Cleanup Workspace Copy') {
+            steps {
+                script {
+                    sh "rm -f ${env.WORKSPACE}/${env.ATTACHMENT_FILENAME} || true"
+                    echo "Cleaned up temporary file: ${env.ATTACHMENT_FILENAME}"
+                }
+            }
+        }
+    }
+
+    post {
+        failure {
+            script {
+                sh "rm -f ${env.WORKSPACE}/${env.ATTACHMENT_FILENAME} || true"
+                emailext(
+                    to: params.EMAIL_RECIPIENT,
+                    subject: "❌ Failed to Send Commit Report (${params.TARGET_ENV}) - ${env.JOB_NAME} #${env.BUILD_NUMBER}",
+                    body: """
+                    Hello,
+
+                    Failed to send the commit report. 
+
+                    Details:
+                    - Job: ${env.JOB_NAME} #${env.BUILD_NUMBER}
+                    - Target Environment: ${params.TARGET_ENV}
+                    - Filename: ${params.ATTACHMENT_FILENAME}
+                    - Delete After Send: ${params.DELETE_AFTER_SEND}
+                    - Error: ${currentBuild.currentResult}
+
+                    Please check Jenkins console for details: ${env.BUILD_URL}
+
+                    Regards,
+                    Jenkins
+                    """
+                )
+            }
+        }
+    }
+}
